@@ -11,21 +11,24 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
   .register("eip155:84532", new ExactEvmScheme())
   .onAfterVerify(async ({ paymentPayload, requirements, result }) => {
     if (!result.isValid) return;
-    const key = claimKey(paymentPayload, requirements);
-    if (!key) return;
-    if (claims.has(key)) {
+    const claim = claimOf(paymentPayload, requirements);
+    if (!claim) return;
+    const claimedUntil = claims.get(claim.key);
+    if (claimedUntil !== undefined && Date.now() < claimedUntil) {
       return { abort: true, reason: "payment_replayed", message: "..." };
     }
-    claims.set(key, Date.now());
+    claims.set(claim.key, claim.expiresAt + CLOCK_SKEW_MS);
   });
 ```
 
-The claim key identifies the authorization rather than the header bytes, so a re-encoded copy still matches:
+The claim key identifies the authorization rather than the header bytes, so a re-encoded copy still matches. A claim lasts until the authorization itself expires:
 
-| Payload | Key |
-| --- | --- |
-| EIP-3009 (`authorization`) | network, asset, `from`, `nonce` (the token contract accepts each nonce from a signer once) |
-| Permit2 (`permit2Authorization`) | network, `from`, `nonce` (Permit2 nonces are per owner, across tokens) |
+| Payload | Key | Kept until |
+| --- | --- | --- |
+| EIP-3009 (`authorization`) | network, asset, `from`, `nonce` (the token contract accepts each nonce from a signer once) | `validBefore` |
+| Permit2 (`permit2Authorization`) | network, `from`, `nonce` as an integer (Permit2 nonces are per owner, across tokens; `"1"`, `"01"` and `"0x1"` sign the same value) | `deadline` |
+
+The signer chooses that expiry, and verification does not cap it at `maxTimeoutSeconds`, so a fixed TTL could release a claim while the authorization can still settle.
 
 Claims are made only after the facilitator reports the payment valid, so an invalid payment never takes a claim.
 
@@ -33,8 +36,8 @@ This complements the [`payment-identifier`](../payment-identifier/) example rath
 
 ## Prerequisites
 
-- Node.js v20+ (install via [nvm](https://github.com/nvm-sh/nvm))
-- pnpm v10 (install via [pnpm.io/installation](https://pnpm.io/installation))
+- Node.js v22+ (install via [nvm](https://github.com/nvm-sh/nvm))
+- pnpm v11.1.1+ (install via [pnpm.io/installation](https://pnpm.io/installation))
 - Valid EVM address for receiving payments (Base Sepolia)
 
 ## Setup
@@ -62,8 +65,8 @@ Pay `GET http://localhost:4021/report` with any client example, then send the sa
 
 ## Production Considerations
 
-- **Shared store.** The in-memory `Map` is atomic within one process. With several instances, claim with an atomic insert in a shared store: Redis `SET key 1 NX EX <ttl>`, or a unique index.
-- **TTL.** Keep claims longer than the route's `maxTimeoutSeconds` plus your slowest handler run; after that the authorization has expired.
+- **Shared store.** The in-memory `Map` is atomic within one process. With several instances, claim with an atomic insert in a shared store: Redis `SET key 1 NX PXAT <expiry ms>`, or a unique index.
+- **Expiry.** Keep each claim until the authorization's own `validBefore` or `deadline`, plus a margin for clock skew. If you need a bounded store, reject authorizations whose expiry is further out than you are willing to retain instead of evicting their claims early.
 - **Store outages.** Decide what happens when a claim cannot be written. Failing closed keeps the guarantee: catch the store error and return an `abort` (for example `reason: "claim_unavailable"`), so the handler does not run. Failing open keeps the route available but gives up duplicate-execution protection while the store is down; the facilitator still refuses a second settlement, but the handler can run for every copy. Fail closed for handlers that are expensive or not idempotent. A hook that throws is logged and skipped by the resource server, which fails open, so don't rely on throwing to refuse.
 - **Retries.** `payment_replayed` means the authorization was presented before, not that the earlier attempt failed. If the client lost the first response, the handler may have run and the payment may have settled, so signing a new authorization can pay twice. Establish the outcome first: for EIP-3009, `authorizationState(from, nonce)` on the token contract shows whether the authorization was used. Pair this guard with [`payment-identifier`](../payment-identifier/) if clients need the stored result of a settled payment returned to them. Sign a new authorization only when the earlier attempt is known to have failed.
 - **Other schemes.** Key on whatever the scheme makes single-use. For `exact` on Solana, hash the transaction message rather than the whole transaction: the fee payer's signature slot is outside the payer's signature.

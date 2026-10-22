@@ -16,11 +16,13 @@ if (!evmAddress || !facilitatorUrl) {
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: facilitatorUrl });
 
-// Must outlive the route's maxTimeoutSeconds plus the slowest handler run.
+// A claim is kept until the authorization it names can no longer settle, so a
+// copy can never run the handler while the original is still valid. The signer
+// chooses that expiry, and verification does not bound it to maxTimeoutSeconds.
 // In-memory claims are atomic within one process; with several instances use a
-// shared store with an atomic insert (Redis SET NX EX, a unique index).
-const CLAIM_TTL_MS = 15 * 60 * 1000;
-const claims = new Map<string, number>();
+// shared store with an atomic insert (Redis SET NX PXAT, a unique index).
+const CLOCK_SKEW_MS = 60 * 1000;
+const claims = new Map<string, number>(); // key -> claimed until (ms)
 
 /**
  * Identifies the authorization a payment carries, so a copy of the same signed
@@ -28,19 +30,30 @@ const claims = new Map<string, number>();
  *
  * @param payload - the verified payment payload
  * @param requirements - the requirements it was verified against
- * @returns claim key, or undefined if the payload carries no nonce
+ * @returns claim key and the authorization's expiry, or undefined if it carries no nonce
  */
-function claimKey(payload: PaymentPayload, requirements: PaymentRequirements): string | undefined {
+function claimOf(
+  payload: PaymentPayload,
+  requirements: PaymentRequirements,
+): { key: string; expiresAt: number } | undefined {
   const evm = payload.payload as ExactEvmPayloadV2;
   if (isPermit2Payload(evm)) {
-    // Permit2 nonces are scoped to the owner, across tokens.
-    const { from, nonce } = evm.permit2Authorization;
-    return `${requirements.network}:permit2:${from.toLowerCase()}:${nonce}`;
+    // Permit2 nonces are uint256s scoped to the owner, across tokens. The signed
+    // value is BigInt(nonce), so "1", "01" and "0x1" are one authorization.
+    const { from, nonce, deadline } = evm.permit2Authorization;
+    return {
+      key: `${requirements.network}:permit2:${from.toLowerCase()}:${BigInt(nonce)}`,
+      expiresAt: Number(deadline) * 1000,
+    };
   }
   if (isEIP3009Payload(evm)) {
-    // EIP-3009 nonces are scoped to the token contract and the signer.
-    const { from, nonce } = evm.authorization;
-    return `${requirements.network}:${requirements.asset.toLowerCase()}:${from.toLowerCase()}:${nonce.toLowerCase()}`;
+    // EIP-3009 nonces are bytes32 scoped to the token contract and the signer;
+    // only the full 32-byte form verifies, so lowercasing is enough.
+    const { from, nonce, validBefore } = evm.authorization;
+    return {
+      key: `${requirements.network}:${requirements.asset.toLowerCase()}:${from.toLowerCase()}:${nonce.toLowerCase()}`,
+      expiresAt: Number(validBefore) * 1000,
+    };
   }
   return undefined;
 }
@@ -53,23 +66,22 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
   // exactly one copy through. Only valid payments are claimed.
   .onAfterVerify(async ({ paymentPayload, requirements, result }) => {
     if (!result.isValid) return;
-    const key = claimKey(paymentPayload as PaymentPayload, requirements as PaymentRequirements);
-    if (!key) return;
-    const now = Date.now();
-    const claimedAt = claims.get(key);
-    if (claimedAt !== undefined && now - claimedAt < CLAIM_TTL_MS) {
+    const claim = claimOf(paymentPayload as PaymentPayload, requirements as PaymentRequirements);
+    if (!claim) return;
+    const claimedUntil = claims.get(claim.key);
+    if (claimedUntil !== undefined && Date.now() < claimedUntil) {
       return {
         abort: true,
         reason: "payment_replayed",
-        message: "This payment authorization was already presented. Sign a new one.",
+        message: "This payment authorization was already presented.",
       };
     }
-    claims.set(key, now);
+    claims.set(claim.key, claim.expiresAt + CLOCK_SKEW_MS);
   });
 
 setInterval(() => {
-  const cutoff = Date.now() - CLAIM_TTL_MS;
-  for (const [key, claimedAt] of claims) if (claimedAt < cutoff) claims.delete(key);
+  const now = Date.now();
+  for (const [key, claimedUntil] of claims) if (claimedUntil <= now) claims.delete(key);
 }, 60 * 1000).unref();
 
 const app = express();
